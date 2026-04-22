@@ -1,0 +1,22 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: synapsid_EQ
+message: >-
+  If you use this dataset, please cite it using the metadata
+  from this file.
+type: dataset
+authors:
+  - given-names: Lucas J.
+    family-names: Legendre
+    email: lucasjlegendre@gmail.com
+    orcid: 'https://orcid.org/0000-0003-1343-8725'
+    affiliation: The University of Texas at Austin
+identifiers:
+  - type: url
+    value: 'https://github.com/LucasLegendre/synapsid_EQ'
+    description: GitHub repository
+abstract: >-
+  Data set and scripts for Benoit et al. (2026, Scientific
+  Reports)
