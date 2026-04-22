@@ -1,0 +1,125 @@
+---
+title: "Tree_calibration_Benoitetal_2026"
+author: "Lucas Legendre"
+date: "`r Sys.Date()`"
+output:  
+  html_document:
+     df_print: paged
+     toc_float:
+      collapsed: false
+      smooth_scroll: false
+     toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Compiled under R version 4.5.3 (2026-03-11)
+
+<b>WARNING</b>: edit the working directory to your preferred folder.
+
+This document details all analyses performed in R for the study:
+Benoit J., Legendre L.J., Midzuk A., Fernandez V., Araújo R., Browning C. Abdala F., Botha J., Angielczyk K. 2026. Evolutionary stasis in synapsid encephalization during the End-Permian mass extinction. *Scientific Reports*.
+
+For more information regarding the study, datasets, and analyses, please refer to the Main Text and Supplementary Information of this paper. If you have any additional questions, feel free to email me at [lucasjlegendre\@gmail.com](mailto:lucasjlegendre@gmail.com){.email}.
+
+### Loading packages
+
+```{r, message = FALSE}
+library(ape)
+library(nlme)
+library(phytools)
+library(geiger)
+library(windex)
+library(AICcmodavg)
+library(evobiR)
+library(tidyverse)
+library(paleotree)
+library(RRphylo)
+library(missMDA)
+library(rr2)
+library(hrbrthemes)
+library(RColorBrewer)
+```
+
+## Data and tree
+
+- Data
+```{r}
+maindata<-read.csv("maindataNew.csv", header=TRUE, sep=";")
+```
+
+- Tree
+```{r}
+maintree<-read.nexus("LystrosaurusEQ2New.trees.nex")
+plotTree(maintree, fsize=0.5, lwd=1, type="fan", ftype="i", part=0.97)
+
+setdiff(maintree$tip.label, maindata$Taxon) 
+setdiff(maindata$Taxon, maintree$tip.label)
+# Perfect match between tip labels and taxa in the dataset
+
+# Reorder data
+maindata2<-ReorderData(maintree, maindata, taxa.names=1)
+rownames(maindata2)<-maindata2$Taxon
+```
+
+### Tree calibration – using `cal3` in `paleotree`
+
+For more information, check '?cal3TimePaleoPhy', Bapst (2012, 2013), and Bapst & Hopkins (2017).
+
+- Extract data frame for calibration
+```{r}
+caldata<-maindata2[,c(5,6)]
+```
+
+- Perform the calibration
+```{r}
+# Estimate of the sampling rate, branching rate, and extinction rate
+likFun <- make_durationFreqCont(caldata)
+srRes <- optim(
+    parInit(likFun),
+    likFun,
+    lower = parLower(likFun),
+    upper = parUpper(likFun),
+    method = "L-BFGS-B",
+    control = list(maxit = 1000000))
+sRate <- srRes[[1]][2] # sampling rate
+divRate <- srRes[[1]][1] # branching/extinction rate
+
+# Generating a sample of 1000 calibrated trees with those parameters (a bit long – please be patient!)
+ttrees <- cal3TimePaleoPhy(
+    maintree,
+    caldata,
+    brRate = divRate,
+    extRate = divRate,
+    FAD.only = FALSE,
+    dateTreatment = "randObs",
+    sampRate = sRate,
+    ntrees = 1000,
+    anc.wt = 0,
+    plot = FALSE)
+
+# Median diversity curve for lineage richness in our sample of trees
+multiDiv(ttrees)
+
+# Generate calibrated consensus tree from our sample of trees
+ttree<-consensus.edges(ttrees, method="least.squares")
+
+# Ladderized, fully dichotomic version for analyses
+RRtree<-ladderize(multi2di(ttree))
+
+# Plot
+plotTree(RRtree, fsize=0.5, lwd=1, ftype="i")
+
+nodetree<-RRtree; nodetree$edge.length<-rep(1, 250) # Version of the tree where all branches have a length of 1 (easier to visualize)
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+
+# Export the tree for future use as a Nexus file
+write.nexus(RRtree, file="CalibratedTreeNew.nex")
+```
+
+## References
+- Bapst, D.W., 2013. A stochastic rate-calibrated method for time-scaling phylogenies of fossil taxa. *Methods in Ecology and Evolution* 4, 724–733. <https://doi.org/10.1111/2041-210X.12081>
+- Bapst, D.W., 2012. paleotree: an R package for paleontological and phylogenetic analyses of evolution. *Methods in Ecology and Evolution* 3, 803–807. <https://doi.org/10.1111/j.2041-210X.2012.00223.x>
+- Bapst, D.W., Hopkins, M.J., 2017. Comparing cal3 and other a posteriori time-scaling approaches in a case study with the pterocephaliid trilobites. *Paleobiology* 43, 49–67. <https://doi.org/10.1017/pab.2016.34>

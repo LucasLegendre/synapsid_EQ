@@ -1,0 +1,1096 @@
+---
+title: "Script Benoit et al. 2026"
+author: "Lucas Legendre"
+date: "`r Sys.Date()`"
+output:  
+  html_document:
+     df_print: paged
+     toc_float:
+      collapsed: false
+      smooth_scroll: false
+     toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Compiled under R version 4.5.3 (2026-03-11)
+
+<b>WARNING</b>: edit the working directory to your preferred folder.
+
+This document details all analyses performed in R for the study:
+Benoit J., Legendre L.J., Midzuk A., Fernandez V., Araújo R., Browning C. Abdala F., Botha J., Angielczyk K. 2026. Evolutionary stasis in synapsid encephalization during the End-Permian mass extinction. *Scientific Reports*.
+
+For more information regarding the study, datasets, and analyses, please refer to the Main Text and Supplementary Information of this paper. If you have any additional questions, feel free to email me at [lucasjlegendre\@gmail.com](mailto:lucasjlegendre@gmail.com){.email}.
+
+### Loading packages
+
+```{r, message = FALSE}
+library(ape)
+library(nlme)
+library(phytools)
+library(phylolm)
+library(geiger)
+library(windex)
+library(AICcmodavg)
+library(evobiR)
+library(tidyverse)
+library(RRphylo)
+library(Rphylopars)
+library(hrbrthemes)
+library(RColorBrewer)
+library(strap)
+library(slouch)
+library(scales)
+```
+
+## Seed and cores
+```{r}
+set.seed(101)
+cc <- max(1, floor(0.5 * parallel::detectCores()))
+```
+
+## Data and tree
+
+- Data
+```{r}
+maindata<-read.csv("maindataNew.csv", header=TRUE, sep=";")
+```
+
+- Tree
+```{r}
+# Calibrated tree (see separate tree calibration script)
+ttree<-read.nexus("CalibratedTreeNew.nex")
+plotTree(ttree, fsize=0.5, lwd=1, ftype="i")
+ttree$root.time<-263
+
+setdiff(ttree$tip.label, maindata$Taxon)
+setdiff(maindata$Taxon, ttree$tip.label)
+# Perfect match between tip labels and taxa in the dataset
+
+# Reorder data
+maindata2<-ReorderData(ttree, maindata, taxa.names=1)
+rownames(maindata2)<-maindata2$Taxon
+```
+
+## Preliminary analyses – evolutionary models, phenograms, ancestral reconstructions
+
+- Log-conversion
+```{r}
+logmain<-maindata2[,c("Taxon", "Order", "Body_mass", "EQ_noOB", "EQ_OB")]
+logmain[,3:5]<-log1p(logmain[,3:5]) # log1p to get only positive values
+```
+
+- Predict missing data in the dataset, using `Rphylopars` (Goolsby et al., 2017)
+```{r}
+# Data
+parsdata<-logmain[,c(1,4,5)]
+colnames(parsdata)[1]<-"species"
+
+# Imputation
+modelpars<-c("BM", "lambda", "EB", "star") # Evolutionary models
+PPE<-list(); BICdat<-data.frame()
+for (i in 1:length(modelpars)) {
+  PPE[[i]]<-phylopars(trait_data = parsdata, tree = ttree, model=modelpars[i])
+  BICdat[i,1]<-BIC(PPE[[i]]) # BIC to compare models
+}
+rownames(BICdat)<-modelpars; colnames(BICdat)<-"BIC"
+BICdat # The lambda model is the best fit
+
+# Extract imputed values and add them to the main dataset
+imp <- PPE[[which.min(BICdat$BIC)]]$anc_recon[1:nrow(logmain),
+                                              c("EQ_noOB","EQ_OB")]
+for(tr in c("EQ_noOB","EQ_OB")) {
+  idx_na <- is.na(logmain[[tr]])
+  logmain[[tr]][idx_na] <- imp[rownames(logmain)[idx_na], tr]
+}
+```
+
+- Phylogenetic signal (Pagel's lambda) in `phytools` (Revell, 2024)
+```{r}
+# Phylogenetic signal (Pagel's lambda)
+var=list(); phy=list(); phydat=data.frame()
+for (i in 3:5) {
+  var<-logmain[,i]; names(var)<-rownames(logmain)
+  var2<-var[!is.na(var)]
+  treevar<-drop.tip(ttree,setdiff(ttree$tip.label,names(var2)))
+  phy[[i]]<-phylosig(treevar, var2, method="lambda", test=TRUE)
+  phydat[i,1]<-colnames(logmain)[i]; phydat[i,2]<-phy[[i]]$lambda; phydat[i,3]<-phy[[i]]$P
+}
+colnames(phydat)<-c("Variable", "Lambda", "P")
+phydat[c(3:5),]
+```
+Signal is very high for body mass (λ > 0.99), high for EQ with and without olfactory bulbs (λ = 0.73 and λ = 0.70, respectively), and highly significant (p < 0.001) for all three traits. 
+
+- Test for best evolutionary model, using `geiger` (Pennell et al., 2014)
+```{r, warning = FALSE}
+models=c("BM", "OU", "EB", "rate_trend","lambda", "white")
+# (For more info, check '?fitContinuous')
+
+var=list(); fit=list(); mod=list()
+for (i in 3:5) {
+  var<-logmain[,i]; names(var)<-rownames(logmain)
+  var2<-var[!is.na(var)]
+  treevar<-multi2di(drop.tip(ttree,setdiff(ttree$tip.label,names(var2))))
+  for (m in 1:length(models)) {
+    fit[[m]]=fitContinuous(treevar, var2, model=models[m], ncores=2)
+  }
+  mod[[i]]<-modSel.geiger(fit[[1]],fit[[2]],fit[[3]],fit[[4]],fit[[5]],fit[[6]])
+}
+mod
+```
+Best model for body mass is an Early Burst model (EB). A Lambda model fits both types of EQ best – both traits follow a Brownian motion model; we can reconstruct ancestral states using such a model and map them on the tree.
+
+- Phenogram for each trait
+```{r}
+for (i in 3:5) {
+  trait<-logmain[,i]; names(trait)<-rownames(logmain)
+  trait<-na.omit(trait)
+  treena<-drop.tip(ttree, setdiff(ttree$tip.label, names(trait)))
+  phenogram(treena, trait, ,ftype="i", spread.labels=TRUE,
+    spread.cost=c(1,0),fsize=0.7,color=palette()[4],
+    xlab="Time (Ma)",ylab=paste("log",colnames(logmain)[i]),cex.axis=0.8,
+    axes=FALSE,las=1, lwd=1)
+  axis(1,at=round(seq(0,max(nodeHeights(treena)),length.out=6),1),
+    label=round(seq(max(nodeHeights(treena)),0,length.out=6),1),
+    cex.axis=0.8)
+  axis(2,las=1,cex.axis=0.8)
+  grid()
+  title(paste(colnames(logmain[i])))
+}
+```
+
+Some clear shifts in all traits, but they seem to occur in Mammaliaformes and less inclusive clades.
+
+- Ancestral state reconstructions
+```{r}
+# Custom color palette
+pal<-c("yellow1","orange1","orangered3","purple4")
+
+# Compile the best tree with corresponding value of lambda for both types of EQ
+lambdaval1<-phydat[4,2]; lambdaval2<-phydat[5,2]
+treeEQnoOB<-ttree; treeEQOB<-ttree
+treeEQnoOB<-rescale(treeEQnoOB, "lambda", lambdaval1)
+treeEQOB<-rescale(treeEQOB, "lambda", lambdaval2)
+treelist<-c(ttree, treeEQnoOB, treeEQOB)
+
+dataplot=list(); fit=list(); obj=list()
+for (i in c(3:5)) {
+  dataplot[[i]]<-logmain[,i]; names(dataplot[[i]])<-rownames(logmain)
+  dataplot[[i]]<-na.omit(dataplot[[i]])
+  treeplot<-treelist[[i-2]]
+  fit[[i]]<-fastAnc(treeplot, dataplot[[i]], vars=TRUE, CI=TRUE)
+  obj[[i]]<-setMap(contMap(treeplot, dataplot[[i]], plot=FALSE),
+                   colors=pal)
+  plot(obj[[i]], fsize=0.5, ftype="i")
+  title(paste('Ancestral state reconstruction for', colnames(logmain)[i]))
+}
+```
+
+As expected from phenograms, we do not see clear shifts in any major therapsid clade outside Mammaliaformes. The pattern in EQ seems to be the exact reverse of that of body mass – as lineages get smaller, their EQ increases. We can test that further for specific lineages and see whether there are any specific shifts in the tree.
+
+### How well correlated to body mass is the EQ? 
+
+We can test it using Phylogenetic Generalized Least Squares (PGLS) regressions.
+
+-   Import function `fitEvolPar` to estimate the best fit of the main parameter (alpha, lambda, or g) in the corresponding evolutionary model (OU, lambda, or EB, respectively)
+
+(To download it from GitHub: <https://github.com/LucasLegendre/fitEvolPar>)
+
+```{r}
+sys.source("fitEvolPar.R", envir = knitr::knit_global())
+```
+
+```{r}
+# Compile the VCV matrix (necessary for a non-ultrametric tree, which is always going to be the case with fossils in the sample)
+Wt<-diag(vcv.phylo(ttree))
+
+# Data frame for 'fitEvolPar'
+EQnoOBd<-logmain[,3:4]
+```
+
+#### Compile individual regressions 
+
+We also test for best evolutionary model in the variance-covariance (VCV) matrix in the error term, using the Akaike Information Criterion corrected for finite sample sizes (AICc).
+
+- For EQ with no OB
+```{r, warning=FALSE}
+# PGLS models
+BM<-gls(EQ_noOB~Body_mass, data=logmain, 
+        correlation=corBrownian(phy=ttree, form=~1), 
+        weights=varFixed(~Wt), method="ML")
+OU<-gls(EQ_noOB~Body_mass, data=logmain, 
+        correlation=corMartins(0.1, phy=ttree, form=~1),
+        weights=varFixed(~Wt), method="ML")
+Lambda<-gls(EQ_noOB~Body_mass, data=logmain, 
+            correlation=corPagel(1, phy=ttree, form=~1),
+            weights=varFixed(~Wt), method="ML")
+EB<-gls(EQ_noOB~Body_mass, data=logmain,
+        correlation=corBlomberg(fitEvolPar(EQnoOBd, ttree,"EB"), 
+                                phy=ttree, fixed = TRUE, form=~1),
+        weights=varFixed(~Wt), method="ML")
+OLS<-gls(EQ_noOB~Body_mass, data=logmain, method="ML")
+
+# AICc
+Cand.models = list()
+Cand.models[[1]] = BM
+Cand.models[[2]] = OU
+Cand.models[[3]] = Lambda
+Cand.models[[4]] = EB
+Cand.models[[5]] = OLS
+
+Modnames = paste(c("BM", "OU", "Lambda", "EB", "OLS"), sep = " ")
+aictab(cand.set = Cand.models, modnames = Modnames, sort = T)
+
+# Best model
+best1<-lm(EQ_noOB~Body_mass, data=logmain)
+summary(best1)
+
+# Plot
+ggplot(logmain, aes(Body_mass, EQ_noOB, color=Order)) +
+  geom_point(size=5) +
+  # geom_text(aes(label=Taxon), hjust=-0.1, vjust=0.4) +
+  xlab("ln body mass (g)") +
+  ylab("ln EQ (no OB)") +
+  geom_abline(intercept=best1$coefficients[1], slope=best1$coefficients[2],
+              colour="royalblue", linewidth=1.3) +
+  scale_color_brewer(palette="Dark2") +
+  theme_ipsum(axis_title_size=15, base_size = 20, axis_text_size = 12)
+```
+
+Best model is a white model (i.e. no phylogenetic signal). The model is significant (p < 0.01), but the pseudo R-squared is extremely low (R^2 = 0.05). Looking at the plot, there does indeed not seem to be any clear effect of body mass on the EQ.
+
+- For EQ with OB
+```{r, warning=FALSE}
+# PGLS models
+BM<-gls(EQ_OB~Body_mass, data=logmain, 
+        correlation=corBrownian(phy=ttree, form=~1), 
+        weights=varFixed(~Wt), method="ML")
+OU<-gls(EQ_OB~Body_mass, data=logmain, 
+        correlation=corMartins(0.1, phy=ttree, form=~1),
+        weights=varFixed(~Wt), method="ML")
+Lambda<-gls(EQ_OB~Body_mass, data=logmain, 
+            correlation=corPagel(1, phy=ttree, form=~1),
+            weights=varFixed(~Wt), method="ML")
+EB<-gls(EQ_OB~Body_mass, data=logmain, 
+        correlation=corBlomberg(fitEvolPar(EQnoOBd, ttree,"EB"), 
+                                phy=ttree, fixed = TRUE, form=~1),
+        weights=varFixed(~Wt), method="ML")
+OLS<-gls(EQ_OB~Body_mass, data=logmain, method="ML")
+
+# AICc
+Cand.models = list()
+Cand.models[[1]] = BM
+Cand.models[[2]] = OU
+Cand.models[[3]] = Lambda
+Cand.models[[4]] = EB
+Cand.models[[5]] = OLS
+
+Modnames = paste(c("BM", "OU", "Lambda", "EB", "OLS"), sep = " ")
+aictab(cand.set = Cand.models, modnames = Modnames, sort = T)
+
+# Best model
+best2<-lm(EQ_OB~Body_mass, data=logmain)
+summary(best2)
+
+# Plot
+ggplot(logmain, aes(Body_mass, EQ_OB, color=Order)) +
+  geom_point(size=5) +
+  # geom_text(aes(label=Taxon), hjust=-0.1, vjust=0.4) +
+  xlab("ln body mass (g)") +
+  ylab("ln EQ (OB)") +
+  geom_abline(intercept=best2$coefficients[1], slope=best2$coefficients[2],
+              colour="royalblue", linewidth=1.3) +
+  scale_color_brewer(palette="Dark2") +
+  theme_ipsum(axis_title_size=15, base_size = 20, axis_text_size = 12)
+```
+
+Similar result as without OB: the regression is significant (p < 0.01), but R-squared is very low (R^2 = 0.07), and there is clearly no signal in the plot.
+
+## Evolutionary rates and testing for shifts, using `RRphylo`
+
+More info on the method (phylogenetic ridge regressions) and how to use it in the very detailed help section and tutorials of this package; see also Kratsch & McHardy (2014) and Castiglione et al. (2018, 2019).
+
+Since we did not recover body mass as a good predictor of EQ, we will not use it here as a covariate to look at the evolution of EQ and test for shifts in values and/or evolutionary rates.
+
+### For EQ with no OB
+
+- Prepare the data and tree
+```{r}
+# Dataset
+EQ1<-logmain[,4]; names(EQ1)<-rownames(logmain)
+
+# Proportion of clusters
+cc <- 2/parallel::detectCores()
+
+# Compile RRphylo
+RREQ1<-RRphylo(tree=ttree, y=EQ1, clus=cc)
+
+# To visualize node numbers in the tree
+nodetree<-ttree; nodetree$edge.length<-rep(1, 250) # Version of the tree where all branches have a length of 1 (easier to visualize)
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:ttree$Nnode,node=1:ttree$Nnode+Ntip(ttree),
+    interactive=FALSE,circle.exp=0.4,cex=0.5)
+```
+
+#### Let's test for significant shifts in evolutionary rates in the tree, using `search.shift`
+
+- In the whole tree (as a first step, to see if any main trends can be identified)
+```{r}
+shiftsWholeR<-search.shift(RREQ1, status.type= "clade")
+shiftsWholeR$all.clades
+as.numeric(rownames(shiftsWholeR$all.clades))-length(ttree$tip.label) # actual node numbers as visualized in plotTree
+
+# Significant shifts
+posshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]>0.975)))
+posshift # Significant positive shifts
+negshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]<0.025)))
+negshift # Significant negative shifts
+
+# Plot them on the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:ttree$Nnode,node=1:ttree$Nnode+Ntip(ttree),
+    interactive=FALSE,circle.exp=0.4,cex=0.5)
+nodelabels(text="+", node=posshift, adj=c(1.5, 1), frame="none", col="red2")
+nodelabels(text="-", node=negshift, adj=c(1.5, 1), frame="none", col="steelblue2")
+```
+
+**Two major series of shifts, both in Eucynodontia**: higher rates in Cynognathia (suggesting a selective pressure on EQ in that clade), and lower rates in Probainognathia (suggesting relaxed constraints, potentially associated with ancestral stabilizing selection). Eucynodontia and the immediately more inclusive clade (with *Platycraniellus*) also show a shift towards a lower rate, suggesting **the trend in Probainognathia is ancestral to eucynodonts**, whereas **that in Cynognathia is a later, distinct shift**.
+
+- Let's make a phylomorphospace for EQ with no OB and body mass, with colors for these two clades:
+```{r}
+# Data
+EQnoOBdat<-logmain[,3:4]
+
+# Basic phylomorphospace, if you need it – remove the 'label="off"' part if you want taxa names, but it gets very crowded!
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+phylomorphospace(ttree,EQnoOBdat,bty="l",label="off",xlab="log (Body mass) (g)",
+    ylab="log (EQ) (no OB)",node.size=c(0,1))
+title(main="Phylomorphospace plot",font.main=3)
+
+# Basic tree with labelled clades
+plotTree(ttree,fsize=0.5,ftype="i")
+nodelabels(frame="circ",bg="white",cex=0.3)
+cladelabels(ttree,c("Probainognathia","Cynognathia"),c(144,179))
+
+# Define colors for the tree
+painted<-paintSubTree(ttree, 144, "Probainognathia")
+painted<-paintSubTree(painted, 179, "Cynognathia")
+
+# Plot it on the tree
+plot(painted, fsize=0.5, ftype="i")
+cladelabels(ttree, c("Probainognathia","Cynognathia"), c(144,179), offset=0.5)
+
+# Plot it on the phylomorphospace
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+phylomorphospace(painted,EQnoOBdat,bty="l",label="off",xlab="log (Body mass) (g)",
+    ylab="log (EQ) (no OB)",node.size=c(0,1.2),node.by.map=TRUE)
+title(main="Phylomorphospace plot",font.main=3)
+legend(x="topleft",legend=c("Cynognathia","Probainognathia"),
+    pch=21,pt.cex=1.5,pt.bg=palette()[2:4],bty="n")
+
+# Plot it on the phenogram
+EQnoOB<-logmain[,4]; names(EQnoOB)<-rownames(logmain)
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+phenogram(painted, EQnoOB, ,ftype="off", spread.labels=TRUE,
+    spread.cost=c(1,0),fsize=0.7,
+    xlab="Time (Ma)",ylab="log (EQ) (no OB)",cex.axis=0.8,
+    axes=FALSE,las=1, lwd=1)
+  axis(1,at=round(seq(0,max(nodeHeights(painted)),length.out=6),1),
+    label=round(seq(max(nodeHeights(painted)),0,length.out=6),1),
+    cex.axis=0.8)
+  axis(2,las=1,cex.axis=0.8)
+  grid()
+  title(paste("Phenogram for EQ (no OB)"))
+  legend(x="bottomright",legend=c("Cynognathia","Probainognathia"),
+    pch=21,pt.cex=1.5,pt.bg=palette()[2:4],bty="n")
+```
+
+As expected, Cynognathia show very high variation in a short amount of time, while the earliest nodes within Probainognathia seem to show limited variation over an extended time frame compared to more inclusive clades in the tree.
+
+Let's go a bit further... Same test, but for specific clades in the tree!
+
+We will be testing for shifts in the following clades: 
+Biarmosuchia, Dinocephalia, Neotherapsida, Dicynodontia, Theriodontia, Gorgonopsia, Eutheriodontia, Therocephalia, Cynodontia, Eucynodontia, Cynognathia, Probainognathia, Mammaliamorpha, Mammaliaformes, Mammalia.
+
+- Specific shifts in those clades
+```{r, warning=FALSE}
+# Node numbers
+nodes<-c(124,120,3,93,4,90,5,83,6,17,53,18,26,28,32)
+cornodes<-nodes+length(ttree$tip.label)
+
+# Look for significant shifts
+shiftsR<-search.shift(RREQ1, status.type= "clade", node=cornodes)
+shiftsR$single.clades
+which(shiftsR$single.clades[,2]>0.975); which(shiftsR$single.clades[,2]<0.025)
+
+posshift<-as.numeric(names(which(shiftsR$single.clades[,2]>0.975)))
+posshift # Significant positive shifts
+negshift<-as.numeric(names(which(shiftsR$single.clades[,2]<0.025)))
+negshift # Significant negative shifts
+
+# Plot them on the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:ttree$Nnode,node=1:ttree$Nnode+Ntip(ttree),
+           interactive=FALSE,circle.exp=0.4,cex=0.5)
+#nodelabels(text="+", node=posshift, adj=c(1.5, 1), frame="none", col="red2")
+nodelabels(text="-", node=negshift, adj=c(1.5, 1), frame="none", col="steelblue2")
+```
+
+Only the ancestral negative shift in Cynodontia, followed by similar shifts in Probainognathia, Mammaliamorpha, Mammaliaformes, and Mammalia are recovered.
+
+- We can plot the shifts on the tree
+```{r}
+RRplotR<-plotRR(RREQ1, y=EQnoOB, multivariate = "rates")
+
+## Recompile individual shifts for the plot
+posshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]>0.975)))
+negshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]<0.025)))
+EQ1shift<-search.shift(RREQ1, status.type= "clade", node=c(posshift, negshift))
+EQ1shift$single.clades<-as.data.frame(EQ1shift$single.clades)
+which(EQ1shift$single.clades[,2]>0.975); which(EQ1shift$single.clades[,2]<0.025)
+
+## Values of EQ
+RRplotR$plotRRphen(variable=1, tree.args=list(no.margin=TRUE),
+                   colorbar.args=list(x=170, y=90, title.pos="bottom"))
+
+## Rates and rate shifts on the same plot
+RRplotR$plotRRrates(variable=1, tree.args=list(no.margin=TRUE),
+                    colorbar.args=list(x=170, y=90, title.pos="bottom"))
+addShift(EQ1shift, symbols.args=list(lwd=2,fg=c(pos="red2",neg="steelblue2"),
+         bg=scales::alpha(c(rep("red2",length(posshift)),
+                            rep("steelblue2",length(negshift))),0.3)))
+
+## Only rate shifts
+plotShiftR<-plotShift(RREQ1, EQ1shift)
+plotShiftR$plotClades(tree.args=list(no.margin=TRUE),
+                      symbols.args=list(lwd=2,fg=c(pos="red2",neg="steelblue2"),
+bg=scales::alpha(c(rep("red2",length(posshift)),
+                   rep("steelblue2",length(negshift))),0.3)))
+```
+
+- Finally, let's test for the significance of those shifts with jacknife/multiple permutation tests, using `overfitRR`. We use a threshold of 0.75 (3/4 of simulated trees recovered with the same shift) to assess a shift as significant.
+```{r}
+# Generate alternative topologies
+resampleEQ1<-resampleTree(RREQ1$tree, node=c(posshift, negshift), nsim=1000)
+
+# Recompile regressions for the new trees
+overfitEQ1<-overfitRR(RREQ1, y=EQnoOB, phylo.list=resampleEQ1, clus=cc)
+
+# Test for shift significance with new topologies
+overshift1<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=148)
+overshift2<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(186,143))
+overshift3<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(150,144))
+overshift4<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(151,145))
+overshift5<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(152,142))
+overshift6<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(153,147))
+overshift7<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(154,185))
+overshift8<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(155,149))
+overshift9<-overfitSS(RR=RREQ1, oveRR=overfitEQ1, node=c(156,146))
+
+# Display the results
+overshift1$shift.results$clade
+overshift2$shift.results$clade
+overshift3$shift.results$clade
+overshift4$shift.results$clade
+overshift5$shift.results$clade
+overshift6$shift.results$clade
+overshift7$shift.results$clade
+overshift8$shift.results$clade
+overshift9$shift.results$clade
+
+```
+Nodes 16 through 30 (i.e. Probainognathia through Mammaliaformes) all have significant negative shifts, whereas all other nodes (i.e. clades within Cynognathia) do not. 
+=> **Only the rate shifts in Probainognathia (negative shifts, i.e. stabilizing selection of EQ) are recovered as significant.**
+
+Now that we have identified shifts in evolutionary rates, what about phenotypic trends (i.e. changes in the actual values of EQ through time)?
+
+#### Testing for significant phenotypic trends for EQ, using `search.trend`
+
+See the vignette and help section of the function, as well as Castiglione et al. (2019). We are testing for significant deviations from a Brownian Motion (BM) model in the value of our trait of interest (EQ).
+
+- For the whole tree
+```{r}
+ST<-search.trend(RR=RREQ1, y=EQnoOB, nsim=1000)
+
+# Display the results
+rateres<-cbind(ST$rate.regression[1,1:4], NA); colnames(rateres)[5]<-"dev"
+phenres<-c(ST$phenotypic.regression[1,1:3], NA, ST$phenotypic.regression[1,4])
+names(phenres)[c(4,5)]<-c("spread", "dev")
+STres<-rbind(rateres, phenres)
+rownames(STres)<-c("rescaled absolute rate regression", "phenotypic regression")
+STres
+```
+The absolute rate regression is not significant (p.random < 0.95), meaning the rates for the whole tree are not significantly different than expected under BM (makes sense, since we only identified localized shifts in the tree earlier). Accordingly, the 'spread' metric is very close to 1 (the expected value under BM).
+
+However, **the phenotypic regression is highly significant** (p.random = 1). The "dev" metric quantifies the deviation of the phenotypic mean of our trait from the root value, expressed in standard deviations of the distribution. Here, dev = 1.85, meaning that the value of EQ is almost twice as high as the standard deviation expected from BM. *There is a strong trend in our phenotype!* Since the slope is positive, this means we have a significant increase in EQ somewhere in the tree.
+
+- Let's test the same nodes we tested earlier for shifts
+```{r}
+STclade1<-search.trend(RR=RREQ1, y=EQnoOB, node=c(250,246,129), nsim=1000)
+STclade2<-search.trend(RR=RREQ1, y=EQnoOB, node=c(219,130,216), nsim=1000)
+STclade3<-search.trend(RR=RREQ1, y=EQnoOB, node=c(131,209,179), nsim=1000)
+STclade4<-search.trend(RR=RREQ1, y=EQnoOB, node=c(143,132,144), nsim=1000)
+STclade5<-search.trend(RR=RREQ1, y=EQnoOB, node=c(152,154,158), nsim=1000)
+
+# Plot trends in EQ value on the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:RREQ1$tree$Nnode,node=1:RREQ1$tree$Nnode+Ntip(RREQ1$tree),
+           interactive=FALSE,circle.exp=0.4,cex=0.5)
+nodelabels(text="EQ+", node=c(129, 130, 131, 132, 143, 144, 152), adj=c(1.1, 1), frame="none", col="red2")
+
+# To get the values of EQ at nodes with significant shifts
+values<-as.data.frame(cbind(as.numeric(rownames(RREQ1$aces)), expm1(RREQ1$aces)))
+Ivalues<-values %>% filter (V1 %in% c(129:132, 143, 144, 152))
+rownames(Ivalues)<-c("Neotherapsida", "Theriodontia", "Eutheriodontia",
+                     "Cynodontia", "Eucynodontia", "Probainognathia",
+                     "Mammaliamorpha")
+colnames(Ivalues)<-c("Node number", "EQ")
+Ivalues
+```
+For absolute values of EQ, we have **two trends of significant increases**: 
+- One *early* in therapsid evolution: Neotherapsida, Theriodontia, Eutheriodontia, and Cynodontia 
+- One *closer to the mammalian lineage*: Eucynodontia, Probainognathia, and Mammaliamorpha
+
+- However, we still need to test for the significance of these trends using `overfitRR`. As for shifts, we use a threshold of p = 0.75 for significance.
+```{r}
+# Generate alternative topologies
+resampleEQ1trend<-resampleTree(RREQ1$tree, nsim=100)
+
+# Recompile regressions for the new trees
+overfitEQ1trend<-overfitRR(RREQ1, y=EQnoOB, phylo.list=resampleEQ1trend, clus=cc)
+
+# Test for trend significance with new topologies
+overtrend1<-overfitST(RR=RREQ1, y=EQnoOB, oveRR=overfitEQ1trend, node=c(129,143), clus=cc)
+overtrend2<-overfitST(RR=RREQ1, y=EQnoOB, oveRR=overfitEQ1trend, node=c(130,144), clus=cc)
+overtrend3<-overfitST(RR=RREQ1, y=EQnoOB, oveRR=overfitEQ1trend, node=c(131,152), clus=cc)
+overtrend4<-overfitST(RR=RREQ1, y=EQnoOB, oveRR=overfitEQ1trend, node=c(132), clus=cc)
+
+# Display results
+## For the whole tree
+overtrend1$trend.results$tree$phenotype
+## For specific nodes
+overtrend1$trend.results$node$phenotype
+overtrend2$trend.results$node$phenotype
+overtrend3$trend.results$node$phenotype
+overtrend4$trend.results$node$phenotype
+```
+The trend of EQ increase is **highly significant** (p > 0.95) for the whole tree and for all tested nodes.
+
+- Let's do a nicer plot of the phenotypic mean on the tree so we can visualize the trend better
+```{r}
+# Extract ancestral states for the phenotypic mean (EQ)
+phenoplot<-ST$trend.data$phenotypeVStime
+phenonames<-rownames(phenoplot); phenonameshort<-phenonames[which(nchar(rownames(phenoplot))==3)]
+phenoanc<-phenoplot[which(nchar(rownames(phenoplot))==3),1]; names(phenoanc)<-phenonameshort
+
+# Plot them on the calibrated tree
+phenoMapCal<-contMap(RREQ1$tree, EQnoOB, method="user", anc.states=phenoanc, plot=FALSE)
+## Previous palette
+plot(setMap(phenoMapCal,colors=colorRampPalette(pal)(10)),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+## Rainbow palette
+plot(setMap(phenoMapCal,colors=rev(brewer.pal(10, "Spectral"))),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+
+# Plot them on the tree with all branch lengths equal (easier to visualize)
+phenoMapEqual<-contMap(nodetree, EQnoOB, method="user", anc.states=phenoanc, plot=FALSE)
+## Previous palette
+plot(setMap(phenoMapEqual,colors=colorRampPalette(pal)(10)),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+## Rainbow palette
+plot(setMap(phenoMapEqual,colors=rev(brewer.pal(10, "Spectral"))),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+```
+
+- Visualize the significant phenotypic shifts on the time-calibrated tree with added geological time scale, using `strap` (Bell & Lloyd, 2015)
+```{r}
+# Simple version
+geoscalePhylo(ttree, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="EQ+", node=c(129, 130, 131, 132, 143, 144, 152), 
+           adj=c(1.1, 1), frame="none", col="red2")
+
+# Version with stratigraphic ranges of individual taxa in the tree
+ages<-maindata[,5:6]; rownames(ages)<-maindata$Taxon
+geoscalePhylo(ttree, ages, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="EQ+", node=c(129, 130, 131, 132, 143, 144, 152), 
+           adj=c(1.1, 1), frame="none", col="red2")
+```
+
+- Same with significant shifts in evolutionary rate
+```{r}
+# Simple version
+geoscalePhylo(ttree, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="-", node=c(144:152, 155), cex=1.5,
+           adj=c(1.1, 1), frame="none", col="steelblue2")
+
+# Version with stratigraphic ranges of individual taxa in the tree
+ages<-maindata[,5:6]; rownames(ages)<-maindata$Taxon
+geoscalePhylo(ttree, ages, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="-", node=c(144:152, 155), cex=1.5,
+           adj=c(1.1, 1), frame="none", col="steelblue2")
+```
+
+### For EQ with OB
+
+- Prepare the data and tree
+```{r}
+# Dataset
+EQ2<-logmain[,5]; names(EQ2)<-rownames(logmain)
+
+# Proportion of clusters
+cc <- 2/parallel::detectCores()
+
+# Compile RRphylo
+RREQ2<-RRphylo(tree=ttree, y=EQ2, clus=cc)
+
+# To visualize node numbers in the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:RREQ2$tree$Nnode,node=1:RREQ2$tree$Nnode+Ntip(RREQ2$tree),
+    interactive=FALSE,circle.exp=0.4,cex=0.5)
+```
+
+#### Let's test for significant shifts in evolutionary rates in the tree, using `search.shift`
+
+- In the whole tree (as a first step, to see if any main trends can be identified)
+```{r}
+shiftsWholeR<-search.shift(RREQ2, status.type= "clade")
+shiftsWholeR$all.clades
+as.numeric(rownames(shiftsWholeR$all.clades))-length(ttree$tip.label) # actual node numbers as visualized in plotTree
+
+# Significant shifts
+posshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]>0.975)))
+posshift # Significant positive shifts
+negshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]<0.025)))
+negshift # Significant negative shifts
+
+# Plot them on the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:RREQ2$tree$Nnode,node=1:RREQ2$tree$Nnode+Ntip(RREQ2$tree),
+    interactive=FALSE,circle.exp=0.4,cex=0.5)
+nodelabels(text="+", node=posshift, adj=c(1.5, 1), frame="none", col="red2")
+nodelabels(text="-", node=negshift, adj=c(1.5, 1), frame="none", col="steelblue2")
+```
+
+**Two major series of shifts, both in Eucynodontia**: higher rates in Cynognathia (suggesting a selective pressure on EQ in that clade), and lower rates in Probainognathia (suggesting relaxed constraints, potentially associated with ancestral stabilizing selection).
+
+Results are very similar to those obtained with EQ with no OB.
+
+- Let's make a phylomorphospace for EQ with OB and body mass, with colors for these two clades:
+```{r}
+# Data
+EQOBdat<-logmain[,c(3,5)]
+
+# Basic phylomorphospace, if you need it – remove the 'label="off"' part if you want taxa names, but it gets very crowded!
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+phylomorphospace(ttree,EQOBdat,bty="l",label="off",xlab="log (Body mass) (g)",
+    ylab="log (EQ) (with OB)",node.size=c(0,1))
+title(main="Phylomorphospace plot",font.main=3)
+
+# Basic tree with labelled clades
+plotTree(ttree,fsize=0.5,ftype="i")
+nodelabels(frame="circ",bg="white",cex=0.3)
+cladelabels(ttree,c("Probainognathia","Cynognathia"),c(144,179))
+
+# Define colors for the tree
+painted<-paintSubTree(ttree, 144, "Cynognathia")
+painted<-paintSubTree(painted, 179, "Probainognathia")
+
+# Plot it on the tree
+plot(painted, fsize=0.5, ftype="i")
+cladelabels(ttree, c("Probainognathia","Cynognathia"), c(144,179), offset=0.5)
+
+# Plot it on the phylomorphospace
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+phylomorphospace(painted,EQOBdat,bty="l",label="off",xlab="log (Body mass) (g)",
+    ylab="log (EQ) (with OB)",node.size=c(0,1.2),node.by.map=TRUE)
+title(main="Phylomorphospace plot",font.main=3)
+legend(x="topleft",legend=c("Cynognathia","Probainognathia"),
+    pch=21,pt.cex=1.5,pt.bg=palette()[2:4],bty="n")
+
+# Plot it on the phenogram
+EQOB<-logmain[,5]; names(EQOB)<-rownames(logmain)
+par(mar = c(5.1, 4.1, 4.1, 2.1))
+phenogram(painted, EQOB, ,ftype="off", spread.labels=TRUE,
+    spread.cost=c(1,0),fsize=0.7,
+    xlab="Time (Ma)",ylab="log (EQ) (with OB)",cex.axis=0.8,
+    axes=FALSE,las=1, lwd=1)
+  axis(1,at=round(seq(0,max(nodeHeights(painted)),length.out=6),1),
+    label=round(seq(max(nodeHeights(painted)),0,length.out=6),1),
+    cex.axis=0.8)
+  axis(2,las=1,cex.axis=0.8)
+  grid()
+  title(paste("Phenogram for EQ (with OB)"))
+  legend(x="bottomright",legend=c("Probainognathia","Cynognathia"),
+    pch=21,pt.cex=1.5,pt.bg=palette()[2:4],bty="n")
+```
+
+As expected, Cynognathia show very high variation in a short amount of time, while the earliest nodes within Probainognathia seem to show limited variation over an extended time frame compared to more inclusive clades in the tree.
+
+Let's go a bit further... Same test, but for specific clades in the tree!
+
+We will be testing for shifts in the following clades: 
+Biarmosuchia, Dinocephalia, Neotherapsida, Dicynodontia, Theriodontia, Gorgonopsia, Eutheriodontia, Therocephalia, Cynodontia, Eucynodontia, Cynognathia, Probainognathia, Mammaliamorpha, Mammaliaformes, Mammalia.
+
+- Specific shifts in those clades
+```{r, warning=FALSE}
+# Node numbers
+nodes<-c(124,120,3,93,4,90,5,83,6,17,53,18,26,28,32) 
+cornodes<-nodes+length(ttree$tip.label)
+
+# Look for significant shifts
+shiftsR<-search.shift(RREQ2, status.type= "clade", node=cornodes)
+shiftsR$single.clades
+which(shiftsR$single.clades[,2]>0.975); which(shiftsR$single.clades[,2]<0.025)
+
+posshift<-as.numeric(names(which(shiftsR$single.clades[,2]>0.975)))
+posshift # Significant positive shifts
+negshift<-as.numeric(names(which(shiftsR$single.clades[,2]<0.025)))
+negshift # Significant negative shifts
+
+# Plot them on the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:RREQ2$tree$Nnode,node=1:RREQ2$tree$Nnode+Ntip(RREQ2$tree),
+    interactive=FALSE,circle.exp=0.4,cex=0.5)
+#nodelabels(text="+", node=posshift, adj=c(1.5, 1), frame="none", col="red2")
+nodelabels(text="-", node=negshift, adj=c(1.5, 1), frame="none", col="steelblue2")
+```
+
+Results are congruent with those of the initial 'auto-recognize' search, but only clades that had already been identified as presenting a significant negative shift **in Probainognathia** are recovered as such.
+
+- We can plot the shifts on the tree
+```{r}
+RRplotR<-plotRR(RREQ2, y=EQOB, multivariate = "rates")
+
+## Recompile individual shifts for the plot
+posshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]>0.975)))
+negshift<-as.numeric(names(which(shiftsWholeR$all.clades[,2]<0.025)))
+EQ2shift<-search.shift(RREQ2, status.type= "clade", node=c(posshift, negshift))
+EQ2shift$single.clades<-as.data.frame(EQ2shift$single.clades)
+which(EQ2shift$single.clades[,2]>0.975); which(EQ2shift$single.clades[,2]<0.025)
+
+## Values of EQ
+RRplotR$plotRRphen(variable=1, tree.args=list(no.margin=TRUE),
+                   colorbar.args=list(x=170, y=90, title.pos="bottom"))
+
+## Rates and rate shifts on the same plot
+RRplotR$plotRRrates(variable=1, tree.args=list(no.margin=TRUE),
+                    colorbar.args=list(x=170, y=90, title.pos="bottom"))
+addShift(EQ2shift, symbols.args=list(lwd=2,fg=c(pos="red2",neg="steelblue2"),
+         bg=scales::alpha(c(rep("red2",length(posshift)),rep("steelblue2",length(negshift))),0.3)))
+
+## Only rate shifts
+plotShiftR<-plotShift(RREQ2, EQ2shift)
+plotShiftR$plotClades(tree.args=list(no.margin=TRUE),
+                  symbols.args=list(lwd=2,fg=c(pos="red2",neg="steelblue2"),
+                                    bg=scales::alpha(c(rep("red2",length(posshift)),rep("steelblue2",length(negshift))),0.3)))
+```
+
+- Finally, let's test for the significance of those shifts with jacknife/multiple permutation tests, using `overfitRR`. We use a threshold of 0.75 (3/4 of simulated trees recovered with the same shift) to assess a shift as significant.
+```{r}
+# Generate alternative topologies
+resampleEQ2<-resampleTree(RREQ2$tree, node=c(posshift, negshift), nsim=1000)
+
+# Recompile regressions for the new trees
+overfitEQ2<-overfitRR(RREQ2, y=EQOB, phylo.list=resampleEQ2, clus=cc)
+
+# Test for shift significance with new topologies
+overshift1<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(181,144))
+overshift2<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(184,145))
+overshift3<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(185,146))
+overshift4<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(186,147))
+overshift5<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(156,148))
+overshift6<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(155,149))
+overshift7<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(154,150))
+overshift8<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(153,151))
+overshift9<-overfitSS(RR=RREQ2, oveRR=overfitEQ2, node=c(152,183))
+
+# Display the results
+overshift1$shift.results$clade$single.clades
+overshift2$shift.results$clade$single.clades
+overshift3$shift.results$clade$single.clades
+overshift4$shift.results$clade$single.clades
+overshift5$shift.results$clade$single.clades
+overshift6$shift.results$clade$single.clades
+overshift7$shift.results$clade$single.clades
+overshift8$shift.results$clade$single.clades
+overshift9$shift.results$clade$single.clades
+```
+Nodes 18 through 30 (i.e. all clades within Probainognathia) all have significant negative  shifts, whereas nodes within Cynodontia (positive shifts) do not. 
+=> **Only the rate shifts in Probainognathia and right outside Eucynodontia (negative, i.e. stabilizing selection of EQ) are recovered as significant.**
+
+Now that we have identified shifts in evolutionary rates, what about phenotypic trends (i.e. changes in the actual values of EQ through time)?
+
+#### Testing for significant phenotypic trends for EQ, using `search.trend`
+
+See the vignette and help section of the function, as well as Castiglione et al. (2019). We are testing for significant deviations from a Brownian Motion (BM) model in the value of our trait of interest (EQ).
+
+- For the whole tree
+```{r}
+ST<-search.trend(RR=RREQ2, y=EQOB, nsim=1000)
+
+# Display the results
+rateres<-cbind(ST$rate.regression[1,1:4], NA); colnames(rateres)[5]<-"dev"
+phenres<-c(ST$phenotypic.regression[1,1:3], NA, ST$phenotypic.regression[1,4])
+names(phenres)[c(4,5)]<-c("spread", "dev")
+STres<-rbind(rateres, phenres)
+rownames(STres)<-c("rescaled absolute rate regression", "phenotypic regression")
+STres
+```
+The absolute rate regression is not significant (p.random < 0.95), meaning the rates for the whole tree are not significantly different than expected under BM (makes sense, since we only identified localized shifts in the tree earlier). Accordingly, the 'spread' metric is very close to 1 (the expected value under BM).
+
+However, **the phenotypic regression is highly significant** (p.random = 1). The "dev" metric quantifies the deviation of the phenotypic mean of our trait from the root value, expressed in standard deviations of the distribution. Here, dev = 2, meaning that the value of EQ is almost twice as high as the standard deviation expected from BM. *There is a strong trend in our phenotype!* Since the slope is positive, this means we have a significant increase in EQ somewhere in the tree.
+
+- Let's test the same nodes we tested earlier for shifts
+```{r}
+STclade1<-search.trend(RR=RREQ2, y=EQOB, node=c(250,246,129), nsim=1000)
+STclade2<-search.trend(RR=RREQ2, y=EQOB, node=c(219,130,216), nsim=1000)
+STclade3<-search.trend(RR=RREQ2, y=EQOB, node=c(131,209,179), nsim=1000)
+STclade4<-search.trend(RR=RREQ2, y=EQOB, node=c(143,132,144), nsim=1000)
+STclade5<-search.trend(RR=RREQ2, y=EQOB, node=c(152,154,158), nsim=1000)
+
+# Plot trends in EQ value on the tree
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+labelnodes(text=1:RREQ2$tree$Nnode,node=1:RREQ2$tree$Nnode+Ntip(RREQ2$tree),
+           interactive=FALSE,circle.exp=0.4,cex=0.5)
+nodelabels(text="EQ+", node=c(129, 130, 131, 132, 143, 144, 152, 154),
+           adj=c(1.1, 1), frame="none", col="red2")
+
+# To get the values of EQ at nodes with significant shifts
+values2<-as.data.frame(cbind(as.numeric(rownames(RREQ2$aces)), expm1(RREQ2$aces)))
+Ivalues2<-values2 %>% filter (V1 %in% c(129:132, 143, 144, 152, 154))
+rownames(Ivalues2)<-c("Neotherapsida", "Theriodontia", "Eutheriodontia",
+                      "Cynodontia", "Eucynodontia", "Probainognathia",
+                      "Mammaliamorpha", "Mammaliaformes")
+colnames(Ivalues2)<-c("Node number", "EQ")
+Ivalues2
+```
+
+Significant shifts in rates are the same as for our previous analyses: a positive shift for Cynognathia and a negative shift for Probainognathia.
+
+For absolute values of EQ, we have **two trends of significant increases**:
+- One *early* in therapsid evolution: Neotherapsida, Theriodontia, Eutheriodontia, and Cynodontia
+- One *closer to the mammalian lineage*: Eucynodontia, Probainognathia, Mammaliamorpha, and Mammaliaformes
+
+- However, we still need to test for the significance of these trends using `overfitRR`. As for shifts, we use a threshold of p = 0.75 for significance.
+```{r}
+# Generate alternative topologies
+resampleEQ2trend<-resampleTree(RREQ2$tree, nsim=100)
+
+# Recompile regressions for the new trees
+overfitEQ2trend<-overfitRR(RREQ2, y=EQOB, phylo.list=resampleEQ2trend, clus=cc)
+
+# Test for trend significance with new topologies
+overtrend1<-overfitST(RR=RREQ2, y=EQOB, oveRR=overfitEQ2trend, node=c(129,154), clus=cc)
+overtrend2<-overfitST(RR=RREQ2, y=EQOB, oveRR=overfitEQ2trend, node=c(130,144), clus=cc)
+overtrend3<-overfitST(RR=RREQ2, y=EQOB, oveRR=overfitEQ2trend, node=c(131,152), clus=cc)
+overtrend4<-overfitST(RR=RREQ2, y=EQOB, oveRR=overfitEQ2trend, node=c(132,143), clus=cc)
+
+# Display results
+## For the whole tree
+overtrend1$trend.results$tree$phenotype
+## For specific nodes
+overtrend1$trend.results$node$phenotype
+overtrend2$trend.results$node$phenotype
+overtrend3$trend.results$node$phenotype
+overtrend4$trend.results$node$phenotype
+```
+The trend of EQ increase is **highly significant** (p > 0.95) for the whole tree and for all tested nodes except Mammaliaformes, which makes the results identical to those of analyses with no OB.
+
+- Let's do a nicer plot of the phenotypic mean on the tree so we can visualize the trend better
+```{r}
+# Extract ancestral states for the phenotypic mean (EQ)
+phenoplot<-ST$trend.data$phenotypeVStime
+phenonames<-rownames(phenoplot); phenonameshort<-phenonames[which(nchar(rownames(phenoplot))==3)]
+phenoanc<-phenoplot[which(nchar(rownames(phenoplot))==3),1]; names(phenoanc)<-phenonameshort
+
+# Plot them on the calibrated tree
+phenoMapCal<-contMap(RREQ1$tree, EQOB, method="user", anc.states=phenoanc, plot=FALSE)
+## Previous palette
+plot(setMap(phenoMapCal,colors=colorRampPalette(pal)(10)),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+## Rainbow palette
+plot(setMap(phenoMapCal,colors=rev(brewer.pal(10, "Spectral"))),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+
+# Plot them on the tree with all branch lengths equal (easier to visualize)
+phenoMapEqual<-contMap(nodetree, EQOB, method="user", anc.states=phenoanc, plot=FALSE)
+## Previous palette
+plot(setMap(phenoMapEqual,colors=colorRampPalette(pal)(10)),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+## Rainbow palette
+plot(setMap(phenoMapEqual,colors=rev(brewer.pal(10, "Spectral"))),fsize=0.5,lwd=4,cex=c(0.5,0.3))
+```
+
+- Same with evolutionary rates
+```{r}
+# Extract ancestral states for evolutionary rates
+rateplot<-ST$trend.data$rateVStime
+ratenames<-rownames(rateplot)
+ratenameshort<-ratenames[which(nchar(rownames(rateplot))==3)]
+rateanc<-rateplot[which(nchar(rownames(rateplot))==3),1]
+names(rateanc)<-ratenameshort
+
+# Plot them on the calibrated tree
+rateMapCal<-contMap(RREQ1$tree, EQOB, method="user", anc.states=rateanc, plot=FALSE)
+## Previous palette
+plot(setMap(rateMapCal,colors=colorRampPalette(pal)(10)),
+     fsize=0.5,lwd=4,cex=c(0.5,0.3))
+## Rainbow palette
+plot(setMap(rateMapCal,colors=rev(brewer.pal(10,"Spectral"))),
+     fsize=0.5,lwd=4,cex=c(0.5,0.3))
+
+# Plot them on the tree with all branch lengths equal (easier to visualize)
+rateMapEqual<-contMap(nodetree, EQOB, method="user", anc.states=rateanc, plot=FALSE)
+## Previous palette
+plot(setMap(rateMapEqual,colors=colorRampPalette(pal)(10)),
+     fsize=0.5,lwd=4,cex=c(0.5,0.3))
+## Rainbow palette
+plot(setMap(rateMapEqual,colors=rev(brewer.pal(10,"Spectral"))),
+     fsize=0.5,lwd=4,cex=c(0.5,0.3))
+```
+
+
+- Visualize the phenotypic shifts on the time-calibrated tree with added geological time scale, using `strap` (Bell & Lloyd, 2015)
+```{r}
+# Simple version
+geoscalePhylo(ttree, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="EQ+", node=c(129, 130, 131, 132, 143, 144, 152), 
+           adj=c(1.1, 1), frame="none", col="red2")
+
+# Version with stratigraphic ranges of individual taxa in the tree
+ages<-maindata[,5:6]; rownames(ages)<-maindata$Taxon
+geoscalePhylo(ttree, ages, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="EQ+", node=c(129, 130, 131, 132, 143, 144, 152), 
+           adj=c(1.1, 1), frame="none", col="red2")
+```
+
+- Same with significant shifts in evolutionary rate
+```{r}
+# Simple version
+geoscalePhylo(ttree, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="-", node=c(142, 144:146, 149:152, 154, 155), cex=1.5,
+           adj=c(1.1, 1), frame="none", col="steelblue2")
+
+# Version with stratigraphic ranges of individual taxa in the tree
+ages<-maindata[,5:6]; rownames(ages)<-maindata$Taxon
+geoscalePhylo(ttree, ages, units=c("Period", "Epoch"), boxes="Epoch", cex.tip=0.4,
+              cex.ts=0.8, tick.scale="Age", x.lim=c(270, 55))
+nodelabels(text="-", node=c(142, 144:146, 149:152, 154, 155), cex=1.5,
+           adj=c(1.1, 1), frame="none", col="steelblue2")
+```
+
+## New analyses of evolutionary shifts  and regimes in an OU framework
+
+### Using `phylolm` (Ho & Ané, 2014)
+```{r, warning=FALSE}
+## For EQ with no OB
+result<-OUshifts(EQ1, ttree, method="mbic", nmax=ttree$Nnode)
+result$mean; result$pshift; result$shift
+par(mar=c(0,0,0,0)); plot.OUshifts(result, cex=0.5, show.data=FALSE)
+
+## For EQ with OB
+result2<-OUshifts(EQ2, ttree, method="mbic", nmax=ttree$Nnode)
+result2$mean; result2$pshift; result2$shift
+par(mar=c(0,0,0,0)); plot.OUshifts(result2, cex=0.5, show.data=FALSE)
+
+## Tree with edge labels to visualize numbers
+plotTree(nodetree, fsize=0.5, lwd=1, ftype="i")
+edgelabels(frame="circle", cex=0.5, bg="white")
+```
+For both EQ (with and without OB), the results are identical: four shifts recovered, only one of which is at an internal branch: branch 29, which leads to node 30: Mammalia + *Cifelliodon* + *Hadrocodium*. It is a positive shift.
+
+The other three shifts are recovered at the following terminal taxa (one therocephalian and two non-eucynodont cynodonts):
+- *Galesaurus planiceps* 1 (positive shift);  
+- *Thrinaxodon liorhinus* 3 (negative shift);  
+- *Tetracynodon darti* 1 (negative shift).  
+
+This seems to be congruent with our previous results obtained with `RRphylo`: the only significant shifts occur near the origin of mammals, with more inclusive clades not affected by the PTME and not showing any conspicuous patterns. We do not, however, recover any shifts near the base of the tree.
+
+### Using `slouch` (Kopperud et al., 2024)
+
+- Preparing the nodes in the tree
+```{r}
+# Defining regimes in the tree (different clades of interest – same as those used with `RRphylo`)
+nodenames<-c(rep("Therapsida", 2), "Neotherapsida", "Theriodontia",
+             "Eutheriodontia", rep("Cynodontia", 11), "Eucynodontia",
+             rep("Probainognathia", 8), rep("Mammaliamorpha", 2),
+             rep("Mammaliaformes", 4), rep("Mammalia", 10),
+             rep("Mammaliamorpha", 5), rep("Probainognathia", 6), 
+             rep("Cynognathia", 22), rep("Cynodontia", 8), 
+             rep("Therocephalia",7), rep("Gorgonopsia", 3), 
+             rep("Dicynodontia", 27), rep("Dinocephalia", 4),
+             rep("Biarmosuchia", 2))
+
+ttree$node.label<-nodenames # Add them as node names in the tree
+
+# Map them on the tree
+tipnames<-c(rep("Biarmosuchia", 3), rep("Dinocephalia", 2), 
+            rep("Dicynodontia", 18), "Gorgonopsia", rep("Therocephalia", 8),
+            rep("Cynodontia", 13), rep("Cynognathia", 13), 
+            rep("Probainognathia", 8), rep("Mammaliamorpha", 4),
+            rep("Mammaliaformes", 4), rep("Mammalia", 11),  
+            rep("Dicynodontia", 4), rep("Cynognathia", 7), rep("Dinocephalia", 3),
+            rep("Dicynodontia", 6), rep("Gorgonopsia", 3), rep("Cynodontia", 6),
+            rep("Cynognathia", 3), rep("Probainognathia", 6),
+            rep("Mammaliamorpha", 3))
+
+regimes<-c(as.factor(tipnames), as.factor(nodenames))
+levels(regimes)<-c("Therapsida", "Biarmosuchia", "Dinocephalia", "Neotherapsida", "Dicynodontia", "Theriodontia", "Gorgonopsia", "Eutheriodontia", "Therocephalia", "Cynodontia", "Eucynodontia", "Cynognathia", "Probainognathia", "Mammaliamorpha", "Mammaliaformes", "Mammalia")
+```
+
+- Color palette for different regimes
+```{r}
+# Custom palette with 16 colors
+rainbowpal<-c(brewer.pal(9,"Set1"), brewer.pal(7,"Set2"))
+show_col(rainbowpal) # Looks good
+names(rainbowpal)<-levels(regimes)
+
+edge_regimes<-factor(regimes[ttree$edge[,2]])
+
+par(mar=c(1,1,1,1)+0.1)
+plot(ttree, 
+     edge.color = rainbowpal[edge_regimes], 
+     edge.width = 3, cex = 0.6) # Groups are correctly separated by color
+```
+
+- Build the model with those regimes
+```{r}
+slouchmod <- slouch.fit(phy = ttree,
+                        species = logmain$Taxon,
+                        response = logmain$EQ_noOB,
+                        fixed.fact = as.factor(tipnames))
+summary(slouchmod)
+
+# BM models for comparison
+## With no regimes (simplest)
+BMmod <- brown.fit(phy = ttree,
+                   species = logmain$Taxon,
+                   response = logmain$EQ_noOB)
+summary(BMmod)
+
+## With regimes (trend)
+BMmodtrend <- brown.fit(phy = ttree,
+                   species = logmain$Taxon,
+                   response = logmain$EQ_noOB,
+                   fixed.fact = as.factor(tipnames))
+summary(BMmodtrend)
+
+slouchmod$modfit$AICc; BMmod$modfit$AICc; BMmodtrend$modfit$AICc 
+# OU is a better fit than BM here
+
+slouchmod$beta_primary$coefficients # optima for each node of interest
+```
+
+## References  
+- Bell, M.A., Lloyd, G.T., 2015. strap: an R package for plotting phylogenies against stratigraphy and assessing their stratigraphic congruence. *Palaeontology* 58, 379–389. <https://doi.org/10.1111/pala.12142>  
+- Castiglione, S., Serio, C., Mondanaro, A., di Febbraro, M., Profico, A., Girardi, G., Raia, P., 2019. Simultaneous detection of macroevolutionary patterns in phenotypic means and rate of change with and within phylogenetic trees including extinct species. *PLOS ONE* 14, e0210101. <https://doi.org/10.1371/journal.pone.0210101>  
+- Castiglione, S., Tesone, G., Piccolo, M., Melchionna, M., Mondanaro, A., Serio, C., di Febbraro, M., Raia, P., 2018. A new method for testing evolutionary rate variation and shifts in phenotypic evolution. *Methods in Ecology and Evolution* 9, 974–983. <https://doi.org/10.1111/2041-210X.12954>  
+- Ho, L.S.T., Ané, C., 2014. A linear-time algorithm for Gaussian and non-Gaussian trait evolution models. *Systematic Biology* 63, 397–408. <https://doi.org/10.1093/sysbio/syu005>  
+- Goolsby, E.W., Bruggeman, J., Ané, C., 2017. Rphylopars: fast multivariate phylogenetic comparative methods for missing data and within-species variation. *Methods in Ecology and Evolution* 8, 22–27. <https://doi.org/10.1111/2041-210X.12612>  
+- Kopperud, B.T., Pienaar, J., Voje, K.L., Orzack, S.H., Hansen, T.F., Grabowski, M., 2024. *slouch: Stochastic Linear Ornstein-Uhlenbeck Comparative Hypotheses.* R package, available at: <https://cran.r-project.org/web/packages/slouch/index.html>
+- Kratsch, C., McHardy, A.C., 2014. RidgeRace: ridge regression for continuous ancestral character estimation on phylogenetic trees. *Bioinformatics* 30, i527–i533. <https://doi.org/10.1093/bioinformatics/btu477>  
+- Pennell, M.W., Eastman, J.M., Slater, G.J., Brown, J.W., Uyeda, J.C., FitzJohn, R.G., Alfaro, M.E., Harmon, L.J., 2014. geiger v2.0: an expanded suite of methods for fitting macroevolutionary models to phylogenetic trees. *Bioinformatics* 30, 2216–2218. <https://doi.org/10.1093/bioinformatics/btu181>  
+- Revell, L.J., 2024. phytools 2.0: an updated R ecosystem for phylogenetic comparative methods (and other things). *PeerJ* 12, e16505. <https://doi.org/10.7717/peerj.16505>  
+
